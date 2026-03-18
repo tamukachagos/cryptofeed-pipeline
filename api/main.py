@@ -23,7 +23,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from api.routers import books, funding, health, metrics, symbols, trades
+from api.routers import billing, books, funding, health, metrics, symbols, trades
 
 app = FastAPI(
     title="CryptoFeed API",
@@ -55,16 +55,6 @@ All endpoints require an `X-API-Key` header. Get a key at [cryptofeed.io/signup]
     license_info={"name": "Commercial"},
 )
 
-# CORS — allow any origin for API access (customers will call from their servers)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
-
-
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     request_id = str(uuid.uuid4())
@@ -81,7 +71,17 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+# Allow POST for billing endpoints
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
 # Routers
+app.include_router(billing.router)
 app.include_router(health.router)
 app.include_router(symbols.router, prefix="/v1")
 app.include_router(trades.router, prefix="/v1")

@@ -24,6 +24,9 @@ python-multipart>=0.0.9
 # AI agents
 anthropic>=0.25
 
+# Billing
+stripe>=7.0
+
 # HTTP (for gap filler REST calls)
 requests>=2.31
 
