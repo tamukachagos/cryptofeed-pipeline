@@ -109,7 +109,9 @@ def backfill_binance_trades(symbol: str, date_str: str, resume: bool) -> bool:
                 df = pd.read_csv(f, header=None, names=[
                     "agg_trade_id", "price", "qty", "first_trade_id", "last_trade_id",
                     "transact_time", "is_buyer_maker"
-                ])
+                ], low_memory=False)
+        # Drop header row if present (some files include column names as first row)
+        df = df[df["transact_time"] != "transact_time"]
 
         df["exchange"]       = "binance"
         df["symbol"]         = symbol
