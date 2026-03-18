@@ -2,6 +2,7 @@
 
 Runs like a top-1% DevOps engineer:
   - Monitors every deployment for failures and auto-rolls back
+  - Reads build logs, sends to Claude, applies code fixes and pushes autonomously
   - Tracks performance (p95 latency, error rate) and alerts
   - Rotates environment variables when API keys change
   - Enforces domain/SSL health
@@ -9,14 +10,15 @@ Runs like a top-1% DevOps engineer:
   - Posts structured logs to logs/vercel_agent.jsonl
 
 Schedule (via orchestrator):
-  Every 5 min  : deployment_watchdog   — catch failures, auto-rollback
-  Every 1 hour : performance_audit     — p95 latency, error rate
-  Every 6 hours: env_sync              — sync .env secrets → Vercel env vars
-  Daily        : weekly_report trigger — full deployment health summary
+  Every 5 min  : deployment_watchdog + autonomous_build_repair
+  Every 1 hour : performance_audit
+  Every 6 hours: env_sync
+  Daily        : daily_report
 
 Usage:
     python agents/vercel_agent.py                  # run all checks once
     python agents/vercel_agent.py --watch          # continuous loop
+    python agents/vercel_agent.py --repair         # run build repair now
     python agents/vercel_agent.py --report         # generate report now
     python agents/vercel_agent.py --rollback       # force rollback to last good
     python agents/vercel_agent.py --sync-env       # push .env to Vercel
@@ -26,6 +28,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -41,13 +45,18 @@ from loguru import logger
 # ── Config ────────────────────────────────────────────────────────────────────
 VERCEL_TOKEN   = os.getenv("VERCEL_TOKEN", "")
 VERCEL_PROJECT = os.getenv("VERCEL_PROJECT", "cryptofeed-web")
-VERCEL_TEAM    = os.getenv("VERCEL_TEAM", "")          # team slug, blank = personal
+VERCEL_TEAM    = os.getenv("VERCEL_TEAM", "")
 ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+# Path to the cryptofeed-web repo on this machine
+WEB_REPO_PATH  = Path(os.getenv("WEB_REPO_PATH", str(Path(__file__).resolve().parents[2] / "cryptofeed-web")))
 LOGS_DIR       = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
 LOG_FILE       = LOGS_DIR / "vercel_agent.jsonl"
 REPORTS_DIR    = Path("reports/vercel")
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+REPAIR_LOG     = LOGS_DIR / "build_repairs.jsonl"
+# Track last repaired deployment to avoid infinite loops
+_last_repaired_uid: str = ""
 
 # Env vars to sync from .env → Vercel (key in .env → name in Vercel)
 ENV_SYNC_KEYS = {
@@ -393,6 +402,227 @@ Be direct and professional. Quantify where possible.""",
         return f"_AI summary failed: {exc}_"
 
 
+def get_build_logs(deployment_uid: str) -> str:
+    """Fetch build log events for a deployment and return as a single string."""
+    qs = _team_qs() or "?"
+    sep = "&" if qs != "?" else "?"
+    url = f"https://api.vercel.com/v2/deployments/{deployment_uid}/events{qs}{sep if qs == '?' else '&'}types=stderr,stdout,error,warning&limit=200"
+    try:
+        r = requests.get(url, headers=_headers(), timeout=20)
+        r.raise_for_status()
+        events = r.json() if isinstance(r.json(), list) else r.json().get("events", [])
+        lines = []
+        for ev in events:
+            text = ev.get("text") or ev.get("payload", {}).get("text", "")
+            if text:
+                lines.append(text)
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"[vercel] Failed to fetch build logs: {e}")
+        return ""
+
+
+def _collect_source_files(error_log: str) -> dict[str, str]:
+    """Parse error log to find which files are mentioned, then read them."""
+    files: dict[str, str] = {}
+    if not WEB_REPO_PATH.exists():
+        logger.warning(f"[vercel] Web repo not found at {WEB_REPO_PATH}")
+        return files
+
+    # Extract file paths from error messages like ./app/foo/bar.tsx or /app/foo/bar.ts
+    patterns = re.findall(r'(?:\./|/)?((?:app|lib|components|pages|proxy|middleware)[^\s:\'\"]+\.(?:tsx?|jsx?))', error_log)
+    seen = set()
+    for rel_path in patterns:
+        if rel_path in seen:
+            continue
+        seen.add(rel_path)
+        full = WEB_REPO_PATH / rel_path
+        if full.exists():
+            try:
+                files[rel_path] = full.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+    # Always include key config files for context
+    for cfg in ["proxy.ts", "middleware.ts", "next.config.ts", "tsconfig.json", "package.json"]:
+        if cfg not in files:
+            p = WEB_REPO_PATH / cfg
+            if p.exists():
+                try:
+                    files[cfg] = p.read_text(encoding="utf-8")
+                except Exception:
+                    pass
+
+    return files
+
+
+def _claude_fix(error_log: str, source_files: dict[str, str]) -> dict[str, str] | None:
+    """Send error log + source files to Claude. Returns {filepath: new_content} patches."""
+    if not ANTHROPIC_KEY:
+        logger.warning("[vercel] No ANTHROPIC_API_KEY — cannot auto-repair.")
+        return None
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+        files_block = "\n\n".join(
+            f"### {path}\n```typescript\n{content}\n```"
+            for path, content in source_files.items()
+        )
+
+        prompt = f"""You are an expert Next.js engineer. A Vercel production build just failed.
+
+## Build Error Log
+```
+{error_log[-4000:]}
+```
+
+## Relevant Source Files
+{files_block}
+
+## Task
+Identify the root cause and return ONLY a JSON object where:
+- Each key is a file path (relative to repo root, e.g. "proxy.ts" or "app/signin/page.tsx")
+- Each value is the COMPLETE corrected file content (not a diff, the full file)
+
+Only include files that need to change. Return valid JSON only, no explanation.
+
+Example format:
+{{"proxy.ts": "import ...\n\nexport async function proxy(...) {{\n  ...\n}}\n"}}"""
+
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = msg.content[0].text.strip()
+
+        # Extract JSON from response (Claude may wrap in ```json blocks)
+        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if json_match:
+            patches = json.loads(json_match.group())
+            logger.success(f"[vercel] Claude generated fixes for: {list(patches.keys())}")
+            return patches
+        else:
+            logger.error(f"[vercel] Claude response was not valid JSON: {raw[:200]}")
+            return None
+    except Exception as e:
+        logger.error(f"[vercel] Claude fix generation failed: {e}")
+        return None
+
+
+def _apply_patches_and_push(patches: dict[str, str], deployment_uid: str) -> bool:
+    """Write patched files, git commit, and push."""
+    if not WEB_REPO_PATH.exists():
+        logger.error(f"[vercel] Repo path not found: {WEB_REPO_PATH}")
+        return False
+
+    try:
+        changed = []
+        for rel_path, content in patches.items():
+            full_path = WEB_REPO_PATH / rel_path
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_text(content, encoding="utf-8")
+            changed.append(rel_path)
+            logger.info(f"[vercel] Patched: {rel_path}")
+
+        if not changed:
+            return False
+
+        # Git add
+        subprocess.run(["git", "add"] + changed, cwd=WEB_REPO_PATH, check=True)
+
+        # Git commit
+        msg = (
+            f"fix: autonomous build repair (failed deployment {deployment_uid[:12]})\n\n"
+            f"Files changed: {', '.join(changed)}\n"
+            f"Auto-fixed by Vercel agent + Claude claude-sonnet-4-6\n\n"
+            f"Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+        )
+        subprocess.run(["git", "commit", "-m", msg], cwd=WEB_REPO_PATH, check=True)
+
+        # Git push
+        subprocess.run(["git", "push", "origin", "master"], cwd=WEB_REPO_PATH, check=True)
+
+        logger.success(f"[vercel] Pushed fix for {len(changed)} file(s). New build triggered.")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"[vercel] Git operation failed: {e}")
+        return False
+
+
+def autonomous_build_repair() -> dict:
+    """
+    Full autonomous repair loop:
+    1. Detect failed build
+    2. Fetch build logs from Vercel
+    3. Send logs + source to Claude
+    4. Apply fix and git push → triggers new build
+    """
+    global _last_repaired_uid
+
+    deployments = get_deployments(limit=5)
+    if not deployments:
+        return {"status": "no_deployments"}
+
+    latest = deployments[0]
+    uid = latest.get("uid", "")
+    state = latest.get("state", "")
+
+    if state != "ERROR":
+        logger.info(f"[vercel] Build repair: latest deployment {uid} state={state}, no action needed.")
+        return {"status": "ok", "state": state}
+
+    if uid == _last_repaired_uid:
+        logger.warning(f"[vercel] Already attempted repair for {uid}, skipping to avoid loop.")
+        return {"status": "already_attempted", "uid": uid}
+
+    logger.warning(f"[vercel] Failed build detected: {uid}. Starting autonomous repair...")
+    log_event("build_repair_started", {"uid": uid})
+
+    # Step 1: Fetch logs
+    build_logs = get_build_logs(uid)
+    if not build_logs:
+        return {"status": "no_logs", "uid": uid}
+
+    # Step 2: Collect relevant source files
+    source_files = _collect_source_files(build_logs)
+    logger.info(f"[vercel] Collected {len(source_files)} source files for context.")
+
+    # Step 3: Ask Claude to fix
+    patches = _claude_fix(build_logs, source_files)
+    if not patches:
+        log_event("build_repair_failed", {"uid": uid, "reason": "claude_returned_no_patches"})
+        return {"status": "repair_failed", "uid": uid}
+
+    # Step 4: Apply and push
+    _last_repaired_uid = uid
+    success = _apply_patches_and_push(patches, uid)
+
+    result = {
+        "status": "repair_pushed" if success else "patch_failed",
+        "uid": uid,
+        "files_patched": list(patches.keys()),
+    }
+
+    # Save repair log
+    with open(REPAIR_LOG, "a") as f:
+        f.write(json.dumps({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "deployment_uid": uid,
+            "files_patched": list(patches.keys()),
+            "success": success,
+        }) + "\n")
+
+    if success:
+        logger.success(f"[vercel] Autonomous repair complete. Vercel will rebuild from new commit.")
+    else:
+        logger.error(f"[vercel] Repair patch generation succeeded but git push failed.")
+
+    return result
+
+
 def force_rollback() -> None:
     """Force rollback to the last READY production deployment."""
     logger.info("[vercel] Forcing rollback to last good deployment...")
@@ -446,7 +676,10 @@ def check_deployments():
     if not VERCEL_TOKEN:
         logger.warning("[vercel] VERCEL_TOKEN not set, skipping.")
         return
-    deployment_watchdog()
+    result = deployment_watchdog()
+    # If build failed, attempt autonomous repair instead of just rolling back
+    if result.get("state") == "ERROR":
+        autonomous_build_repair()
 
 
 def audit_performance():
@@ -475,6 +708,7 @@ def daily_report():
 def main():
     parser = argparse.ArgumentParser(description="CryptoFeed Vercel Agent")
     parser.add_argument("--watch",    action="store_true", help="Continuous watch loop (30s interval)")
+    parser.add_argument("--repair",   action="store_true", help="Run autonomous build repair now")
     parser.add_argument("--report",   action="store_true", help="Generate full deployment report now")
     parser.add_argument("--rollback", action="store_true", help="Force rollback to last good deployment")
     parser.add_argument("--sync-env", action="store_true", help="Sync .env secrets → Vercel")
@@ -487,6 +721,9 @@ def main():
 
     if args.status:
         status_dashboard()
+    elif args.repair:
+        result = autonomous_build_repair()
+        print(json.dumps(result, indent=2))
     elif args.rollback:
         force_rollback()
     elif args.sync_env:
