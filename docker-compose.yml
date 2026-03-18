@@ -7,7 +7,7 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -23,7 +23,8 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./data:/data
+      - ${DATA_DIR:-./data}:/data
+      - ./logs:/app/logs
     restart: unless-stopped
     logging:
       driver: "json-file"
@@ -39,13 +40,54 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./data:/data
+      - ${DATA_DIR:-./data}:/data
+      - ./logs:/app/logs
     restart: unless-stopped
     logging:
       driver: "json-file"
       options:
         max-size: "50m"
         max-file: "5"
+
+  api:
+    build: .
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - BYPASS_AUTH=false
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ./api/keys.json:/app/api/keys.json
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  agents:
+    build: .
+    command: python agents/orchestrator.py
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+      - ./api/keys.json:/app/api/keys.json
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
 
 volumes:
   redis_data:
