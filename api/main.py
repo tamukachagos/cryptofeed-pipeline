@@ -23,7 +23,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from api.routers import billing, books, funding, health, metrics, symbols, trades
+from api.routers import billing, books, funding, health, internal, metrics, symbols, trades
 
 app = FastAPI(
     title="CryptoFeed API",
@@ -71,17 +71,17 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
-# Allow POST for billing endpoints
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://cryptodataapi.dev", "https://www.cryptodataapi.dev"],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH"],
+    allow_headers=["Content-Type", "X-API-Key", "X-Internal-Secret"],
 )
 
 # Routers
 app.include_router(billing.router)
+app.include_router(internal.router)
 app.include_router(health.router)
 app.include_router(symbols.router, prefix="/v1")
 app.include_router(trades.router, prefix="/v1")

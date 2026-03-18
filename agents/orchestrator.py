@@ -7,8 +7,8 @@ Usage:
 
 Schedule:
     Every 5 min  : exchange_health, vercel_watchdog
-    Every 1 hour : quality_monitor, vercel_performance
-    Every 6 hours: gap_filler, vercel_env_sync
+    Every 1 hour : quality_monitor, vercel_performance, security_auditor, auth_health_monitor, dashboard_freshness
+    Every 6 hours: gap_filler, vercel_env_sync, seo_monitor, user_lifecycle_agent
     Daily 00:05  : daily_report, vercel_daily_report
 """
 from __future__ import annotations
@@ -34,6 +34,12 @@ SCHEDULE = [
     {"name": "vercel_env_sync",       "module": "agents.vercel_agent",     "fn": "sync_environment",   "interval_s": 21600},
     {"name": "daily_report",          "module": "agents.daily_report",     "fn": "main",               "interval_s": 86400},
     {"name": "vercel_daily_report",   "module": "agents.vercel_agent",     "fn": "daily_report",       "interval_s": 86400},
+    # Website maintenance agents
+    {"name": "security_auditor",      "module": "agents.website_agents",   "fn": "security_auditor",   "interval_s": 3600},
+    {"name": "auth_health_monitor",   "module": "agents.website_agents",   "fn": "auth_health_monitor","interval_s": 3600},
+    {"name": "dashboard_freshness",   "module": "agents.website_agents",   "fn": "dashboard_freshness","interval_s": 3600},
+    {"name": "seo_monitor",           "module": "agents.website_agents",   "fn": "seo_monitor",        "interval_s": 21600},
+    {"name": "user_lifecycle_agent",  "module": "agents.website_agents",   "fn": "user_lifecycle_agent","interval_s": 21600},
 ]
 
 _last_run: dict[str, float] = {}

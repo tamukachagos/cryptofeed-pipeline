@@ -128,6 +128,25 @@ async def stripe_webhook(request: Request):
 
         # Generate API key
         api_key = _generate_key(plan, email, customer_id)
+        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+        key_prefix = api_key[:12] + "..."
+
+        # Persist user in SQLite via internal router
+        try:
+            from api.routers.internal import _get_db
+            conn = _get_db()
+            conn.execute(
+                """INSERT OR REPLACE INTO users
+                   (email, plan, api_key_hash, api_key_prefix, stripe_customer_id, created_at,
+                    requests_today, requests_this_month, daily_usage)
+                   VALUES (?, ?, ?, ?, ?, ?, 0, 0, '0,0,0,0,0,0,0')""",
+                (email, plan, key_hash, key_prefix, customer_id,
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as db_err:
+            logger.error(f"[billing] DB write failed: {db_err}")
 
         # Store for success page retrieval
         _pending[session_id] = {
