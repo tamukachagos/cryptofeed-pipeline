@@ -12,6 +12,15 @@ numpy>=1.26
 pydantic>=2.0
 sortedcontainers>=2.4
 
+# Secret encryption at rest (Fernet — AES-128-CBC + HMAC-SHA256)
+cryptography>=42.0
+
+# PostgreSQL (production database)
+psycopg2-binary>=2.9
+
+# Monitoring
+prometheus-client>=0.20
+
 # Logging & config
 loguru>=0.7
 python-dotenv>=1.0

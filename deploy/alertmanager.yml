@@ -1,0 +1,62 @@
+global:
+  resolve_timeout: 5m
+
+  # SMTP fallback (optional)
+  smtp_smarthost: "${SMTP_HOST:-localhost}:${SMTP_PORT:-587}"
+  smtp_from: "${SMTP_FROM:-alerts@cryptodataapi.dev}"
+  smtp_auth_username: "${SMTP_USER}"
+  smtp_auth_password: "${SMTP_PASSWORD}"
+  smtp_require_tls: true
+
+route:
+  group_by: ["alertname", "severity"]
+  group_wait:      30s
+  group_interval:  5m
+  repeat_interval: 4h
+  receiver: pagerduty_default
+
+  routes:
+    # Critical alerts → PagerDuty immediately
+    - match:
+        severity: critical
+      receiver: pagerduty_critical
+      continue: true
+
+    # All alerts → email as well
+    - match_re:
+        severity: warning|critical
+      receiver: email_ops
+
+receivers:
+
+  - name: pagerduty_default
+    pagerduty_configs:
+      - routing_key: "${PAGERDUTY_INTEGRATION_KEY}"
+        description: "{{ .GroupLabels.alertname }}: {{ .CommonAnnotations.summary }}"
+        severity: "{{ .CommonLabels.severity }}"
+        details:
+          description: "{{ .CommonAnnotations.description }}"
+          num_alerts: "{{ len .Alerts }}"
+
+  - name: pagerduty_critical
+    pagerduty_configs:
+      - routing_key: "${PAGERDUTY_CRITICAL_KEY:-${PAGERDUTY_INTEGRATION_KEY}}"
+        description: "[CRITICAL] {{ .GroupLabels.alertname }}: {{ .CommonAnnotations.summary }}"
+        severity: critical
+        details:
+          description: "{{ .CommonAnnotations.description }}"
+
+  - name: email_ops
+    email_configs:
+      - to: "${OPS_EMAIL:-ops@cryptodataapi.dev}"
+        send_resolved: true
+        headers:
+          Subject: "[CryptoFeed {{ .Status | toUpper }}] {{ .GroupLabels.alertname }}"
+
+inhibit_rules:
+  # If the API is down, suppress downstream warnings about error rates
+  - source_match:
+      alertname: ApiDown
+    target_match_re:
+      alertname: ApiHighErrorRate|AuthFailureSpike
+    equal: ["job"]

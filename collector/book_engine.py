@@ -46,6 +46,19 @@ class OrderBookEngine:
         self._last_seq = seq
         self._initialized = True
 
+        # Validate: crossed book (best_bid >= best_ask) is invalid — clear and warn
+        bb = self.best_bid()
+        ba = self.best_ask()
+        if bb and ba and bb[0] >= ba[0]:
+            from loguru import logger
+            logger.warning(
+                f"[{self.exchange}:{self.symbol}] Crossed book in snapshot "
+                f"(best_bid={bb[0]} >= best_ask={ba[0]}) — discarding snapshot"
+            )
+            self._bids.clear()
+            self._asks.clear()
+            self._initialized = False
+
     def apply_delta(self, bids: list, asks: list, seq: int = -1) -> bool:
         """Apply incremental update. Returns False if sequence gap detected."""
         if not self._initialized:

@@ -2,6 +2,9 @@
 .env
 *.env
 
+# API key store — contains hashed customer keys, never commit
+api/keys.json
+
 # Data (don't commit raw collected data — too large)
 data/
 logs/

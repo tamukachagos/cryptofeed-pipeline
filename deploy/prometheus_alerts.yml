@@ -1,0 +1,70 @@
+groups:
+
+  - name: redis
+    rules:
+
+      # Redis memory above 80 % of maxmemory
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_config_maxmemory > 0.80
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis memory > 80 %"
+          description: "Redis is using {{ $value | humanizePercentage }} of its maxmemory. noeviction is active — OOM errors will occur at 100 %."
+
+      # Redis memory above 90 % — page immediately
+      - alert: RedisMemoryCritical
+        expr: redis_memory_used_bytes / redis_config_maxmemory > 0.90
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis memory > 90 % — CRITICAL"
+          description: "Redis is at {{ $value | humanizePercentage }} memory. Rate-limit and nonce keys will stop being written. Immediate action required."
+
+      # Redis down
+      - alert: RedisDown
+        expr: up{job="redis"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is unreachable"
+          description: "The Redis exporter has been unable to reach Redis for more than 1 minute. All rate-limiting and session data is unavailable."
+
+  - name: api
+    rules:
+
+      # High error rate (5xx)
+      - alert: ApiHighErrorRate
+        expr: >
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total[5m])) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API 5xx error rate > 5 %"
+          description: "{{ $value | humanizePercentage }} of requests are returning 5xx errors."
+
+      # API down
+      - alert: ApiDown
+        expr: up{job="cryptofeed_api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CryptoFeed API is unreachable"
+          description: "Prometheus cannot scrape the API /metrics endpoint. Service may be down."
+
+      # Auth failure spike — possible brute-force
+      - alert: AuthFailureSpike
+        expr: rate(auth_failures_total[5m]) > 10
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated auth failure rate"
+          description: "More than 10 auth failures/sec in the last 5 minutes — possible brute-force attack."

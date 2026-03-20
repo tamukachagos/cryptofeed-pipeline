@@ -21,10 +21,13 @@ STREAMS_TO_CHECK = [
 def health() -> HealthResponse:
     stream_lengths = {}
     try:
+        password = os.getenv("REDIS_PASSWORD", "") or None
         r = redis.Redis(
             host=os.getenv("REDIS_HOST", "localhost"),
             port=int(os.getenv("REDIS_PORT", 6379)),
+            password=password,
             decode_responses=True,
+            socket_timeout=2,
         )
         for s in STREAMS_TO_CHECK:
             stream_lengths[s] = r.xlen(s)

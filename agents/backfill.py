@@ -109,9 +109,10 @@ def backfill_binance_trades(symbol: str, date_str: str, resume: bool) -> bool:
                 df = pd.read_csv(f, header=None, names=[
                     "agg_trade_id", "price", "qty", "first_trade_id", "last_trade_id",
                     "transact_time", "is_buyer_maker"
-                ], low_memory=False)
+                ], dtype=str, low_memory=False)
         # Drop header row if present (some files include column names as first row)
-        df = df[df["transact_time"] != "transact_time"]
+        df = df[df["transact_time"].str.strip() != "transact_time"]
+        df = df[pd.to_numeric(df["transact_time"], errors="coerce").notna()]
 
         df["exchange"]       = "binance"
         df["symbol"]         = symbol
@@ -326,45 +327,302 @@ def backfill_okx_funding(symbol: str, date_str: str, resume: bool) -> bool:
     return True
 
 
+# ─── BINANCE OHLCV (Binance Vision bulk klines) ──────────────────────────────
+
+def backfill_binance_ohlcv(symbol: str, date_str: str, interval: str, resume: bool) -> bool:
+    key = f"binance:ohlcv:{interval}:{symbol}:{date_str}"
+    if resume and key in _load_done():
+        return True
+
+    fname = f"{symbol}-{interval}-{date_str}.zip"
+    url = f"https://data.binance.vision/data/futures/um/daily/klines/{symbol}/{interval}/{fname}"
+    try:
+        r = SESSION.get(url, timeout=60)
+        if r.status_code == 404:
+            logger.warning(f"[backfill] Not available: binance ohlcv {symbol} {interval} {date_str}")
+            return False
+        r.raise_for_status()
+    except Exception as e:
+        logger.error(f"[backfill] Binance OHLCV download failed {symbol} {date_str}: {e}")
+        return False
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+            with zf.open(zf.namelist()[0]) as f:
+                df = pd.read_csv(f, header=None, names=[
+                    "open_time", "open", "high", "low", "close", "volume",
+                    "close_time", "quote_volume", "trades", "taker_buy_base",
+                    "taker_buy_quote", "ignore"
+                ], low_memory=False)
+
+        # Drop header row if present
+        df = df[df["open_time"] != "open_time"]
+
+        df["exchange"]     = "binance"
+        df["symbol"]       = symbol
+        df["timestamp_ns"] = (df["open_time"].astype("int64") * 1_000_000)
+        df["interval"]     = interval
+        df["open"]         = df["open"].astype(float)
+        df["high"]         = df["high"].astype(float)
+        df["low"]          = df["low"].astype(float)
+        df["close"]        = df["close"].astype(float)
+        df["volume"]       = df["volume"].astype(float)
+        df["quote_volume"] = df["quote_volume"].astype(float)
+        df["trades"]       = df["trades"].astype("int64")
+        df["is_closed"]    = True
+
+        result = df[["exchange", "symbol", "timestamp_ns", "interval",
+                     "open", "high", "low", "close", "volume", "quote_volume", "trades", "is_closed"]]
+        _write_parquet(result, "ohlcv", "binance", symbol, date_str)
+        _mark_done(key)
+        return True
+
+    except Exception as e:
+        logger.error(f"[backfill] Binance OHLCV parse failed {symbol} {date_str}: {e}")
+        return False
+
+
+# ─── BINANCE OPEN INTEREST (REST history, 90-day window, 5m granularity) ─────
+
+def backfill_binance_oi(symbol: str, date_str: str, resume: bool) -> bool:
+    key = f"binance:open_interest:{symbol}:{date_str}"
+    if resume and key in _load_done():
+        return True
+
+    date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    start_ms = int(date.timestamp() * 1000)
+    end_ms   = int((date + timedelta(days=1)).timestamp() * 1000)
+
+    all_rows = []
+    try:
+        r = SESSION.get(
+            "https://fapi.binance.com/futures/data/openInterestHist",
+            params={"symbol": symbol, "period": "5m", "limit": 500,
+                    "startTime": start_ms, "endTime": end_ms},
+            timeout=15,
+        )
+        if r.status_code == 400:
+            logger.warning(f"[backfill] Binance OI not available (too old?) for {symbol} {date_str}")
+            return False
+        r.raise_for_status()
+        all_rows = r.json()
+    except Exception as e:
+        logger.error(f"[backfill] Binance OI fetch failed {symbol} {date_str}: {e}")
+        return False
+
+    if not all_rows:
+        return False
+
+    df = pd.DataFrame(all_rows)
+    df["exchange"]             = "binance"
+    df["symbol"]               = symbol
+    df["timestamp_ns"]         = (df["timestamp"].astype("int64") * 1_000_000)
+    df["open_interest"]        = df["sumOpenInterest"].astype(float)
+    df["open_interest_value"]  = df["sumOpenInterestValue"].astype(float)
+
+    result = df[["exchange", "symbol", "timestamp_ns", "open_interest", "open_interest_value"]]
+    _write_parquet(result, "open_interest", "binance", symbol, date_str)
+    _mark_done(key)
+    return True
+
+
+# ─── BYBIT OHLCV (REST klines endpoint) ──────────────────────────────────────
+
+def backfill_bybit_ohlcv(symbol: str, date_str: str, interval: str, resume: bool) -> bool:
+    key = f"bybit:ohlcv:{interval}:{symbol}:{date_str}"
+    if resume and key in _load_done():
+        return True
+
+    date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    start_ms = int(date.timestamp() * 1000)
+    end_ms   = int((date + timedelta(days=1)).timestamp() * 1000)
+
+    all_rows = []
+    cursor_start = start_ms
+    for _ in range(50):  # max 50 pages × 1000 = 50,000 candles (way more than 1440/day for 1m)
+        try:
+            r = SESSION.get(
+                "https://api.bybit.com/v5/market/kline",
+                params={"category": "linear", "symbol": symbol, "interval": interval,
+                        "start": cursor_start, "end": end_ms, "limit": 1000},
+                timeout=15,
+            )
+            if r.status_code == 403:
+                logger.warning(f"[backfill] Bybit OHLCV geo-blocked (403) — skipping {symbol} {date_str}")
+                return False
+            r.raise_for_status()
+            data = r.json()
+            candles = data.get("result", {}).get("list", [])
+        except Exception as e:
+            logger.error(f"[backfill] Bybit OHLCV fetch failed {symbol} {date_str}: {e}")
+            break
+
+        if not candles:
+            break
+
+        all_rows.extend(candles)
+        # Bybit returns newest-first; the last item has the oldest timestamp
+        oldest_ts = int(candles[-1][0])
+        if oldest_ts <= start_ms:
+            break
+        cursor_start = oldest_ts + 1
+        time.sleep(0.1)
+
+    if not all_rows:
+        logger.warning(f"[backfill] Bybit OHLCV: no candles for {symbol} {date_str}")
+        return False
+
+    # Bybit candle format: [startTime, open, high, low, close, volume, turnover]
+    df = pd.DataFrame(all_rows, columns=["start_time", "open", "high", "low", "close", "volume", "turnover"])
+    df["timestamp_ns"]  = (df["start_time"].astype("int64") * 1_000_000)
+    df["exchange"]      = "bybit"
+    df["symbol"]        = symbol
+    df["interval"]      = interval
+    df["open"]          = df["open"].astype(float)
+    df["high"]          = df["high"].astype(float)
+    df["low"]           = df["low"].astype(float)
+    df["close"]         = df["close"].astype(float)
+    df["volume"]        = df["volume"].astype(float)
+    df["quote_volume"]  = df["turnover"].astype(float)
+    df["is_closed"]     = True
+
+    # Filter to only this day
+    df = df[(df["timestamp_ns"] >= start_ms * 1_000_000) & (df["timestamp_ns"] < end_ms * 1_000_000)]
+    df = df.sort_values("timestamp_ns")
+
+    result = df[["exchange", "symbol", "timestamp_ns", "interval",
+                 "open", "high", "low", "close", "volume", "quote_volume", "is_closed"]]
+    _write_parquet(result, "ohlcv", "bybit", symbol, date_str)
+    _mark_done(key)
+    return True
+
+
+# ─── OKX OHLCV (REST history-candles endpoint) ───────────────────────────────
+
+def backfill_okx_ohlcv(symbol: str, date_str: str, interval: str, resume: bool) -> bool:
+    key = f"okx:ohlcv:{interval}:{symbol}:{date_str}"
+    if resume and key in _load_done():
+        return True
+
+    inst_id = _okx_symbol(symbol)
+    date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    start_ms = int(date.timestamp() * 1000)
+    end_ms   = int((date + timedelta(days=1)).timestamp() * 1000)
+
+    all_rows = []
+    # Start pagination from end of target day — OKX `after` returns candles OLDER than given ts
+    after = str(end_ms)
+    for _ in range(20):  # 1440 candles/day ÷ 100 per page = 15 pages max
+        params = {"instId": inst_id, "bar": interval, "after": after, "limit": 100}
+
+        try:
+            r = SESSION.get(f"{OKX_BASE}/api/v5/market/history-candles", params=params, timeout=15)
+            r.raise_for_status()
+            candles = r.json().get("data", [])
+        except Exception as e:
+            logger.error(f"[backfill] OKX OHLCV fetch failed {symbol} {date_str}: {e}")
+            break
+
+        if not candles:
+            break
+
+        done = False
+        for c in candles:
+            ts_ms = int(c[0])
+            if ts_ms < start_ms:
+                done = True
+                break
+            all_rows.append(c)
+
+        if done:
+            break
+
+        after = candles[-1][0]
+        time.sleep(0.1)
+
+    if not all_rows:
+        logger.warning(f"[backfill] OKX OHLCV: no candles for {symbol} {date_str}")
+        return False
+
+    # OKX candle: [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
+    df = pd.DataFrame(all_rows)
+    df["exchange"]     = "okx"
+    df["symbol"]       = symbol
+    df["timestamp_ns"] = (df[0].astype("int64") * 1_000_000)
+    df["interval"]     = interval
+    df["open"]         = df[1].astype(float)
+    df["high"]         = df[2].astype(float)
+    df["low"]          = df[3].astype(float)
+    df["close"]        = df[4].astype(float)
+    df["volume"]       = df[5].astype(float)
+    df["quote_volume"] = df[7].astype(float) if 7 in df.columns else 0.0
+    df["is_closed"]    = df[8].astype(str) == "1" if 8 in df.columns else True
+
+    df = df.sort_values("timestamp_ns")
+    result = df[["exchange", "symbol", "timestamp_ns", "interval",
+                 "open", "high", "low", "close", "volume", "quote_volume", "is_closed"]]
+    _write_parquet(result, "ohlcv", "okx", symbol, date_str)
+    _mark_done(key)
+    return True
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def run_backfill(days: int = 90, exchanges: list[str] | None = None,
-                 symbols: list[str] | None = None, resume: bool = True) -> None:
+                 symbols: list[str] | None = None, resume: bool = True,
+                 data_types: list[str] | None = None) -> None:
 
     if exchanges is None:
         exchanges = ["binance", "bybit", "okx"]
     if symbols is None:
         symbols = SYMBOLS
+    if data_types is None:
+        data_types = ["trades", "funding", "ohlcv", "open_interest"]
 
     today = datetime.now(timezone.utc).date()
     dates = [(today - timedelta(days=d)).strftime("%Y-%m-%d") for d in range(1, days + 1)]
 
     logger.info(f"[backfill] Starting: {days} days, {len(exchanges)} exchanges, {len(symbols)} symbols")
+    logger.info(f"[backfill] Data types: {data_types}")
     logger.info(f"[backfill] Date range: {dates[-1]} → {dates[0]}")
 
-    total = ok = skipped = failed = 0
+    total = ok = failed = 0
 
     for date_str in reversed(dates):  # oldest first
         for symbol in symbols:
             for exchange in exchanges:
                 total += 1
+                results = []
 
                 if exchange == "binance":
-                    r1 = backfill_binance_trades(symbol, date_str, resume)
-                    r2 = backfill_binance_funding(symbol, date_str, resume)
-                    success = r1
+                    if "trades" in data_types:
+                        results.append(backfill_binance_trades(symbol, date_str, resume))
+                    if "funding" in data_types:
+                        backfill_binance_funding(symbol, date_str, resume)
+                    if "ohlcv" in data_types:
+                        results.append(backfill_binance_ohlcv(symbol, date_str, "1m", resume))
+                    if "open_interest" in data_types:
+                        backfill_binance_oi(symbol, date_str, resume)
+
                 elif exchange == "bybit":
-                    success = backfill_bybit_trades(symbol, date_str, resume)
+                    if "trades" in data_types:
+                        results.append(backfill_bybit_trades(symbol, date_str, resume))
+                    if "ohlcv" in data_types:
+                        results.append(backfill_bybit_ohlcv(symbol, date_str, "1", resume))
+
                 elif exchange == "okx":
-                    r1 = backfill_okx_trades(symbol, date_str, resume)
-                    r2 = backfill_okx_funding(symbol, date_str, resume)
-                    success = r1
+                    if "trades" in data_types:
+                        results.append(backfill_okx_trades(symbol, date_str, resume))
+                    if "funding" in data_types:
+                        backfill_okx_funding(symbol, date_str, resume)
+                    if "ohlcv" in data_types:
+                        results.append(backfill_okx_ohlcv(symbol, date_str, "1m", resume))
                 else:
                     continue
 
-                if success:
+                if any(results):
                     ok += 1
-                else:
+                elif results:
                     failed += 1
 
                 # Polite delay
@@ -379,16 +637,19 @@ def run_backfill(days: int = 90, exchanges: list[str] | None = None,
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Backfill 90 days of historical crypto data")
+    parser = argparse.ArgumentParser(description="Backfill historical crypto data")
     parser.add_argument("--days",     type=int, default=90,  help="Number of days to backfill")
     parser.add_argument("--exchange", type=str, default=None, help="binance, bybit, or okx (default: all)")
     parser.add_argument("--symbol",   type=str, default=None, help="e.g. BTCUSDT (default: all)")
+    parser.add_argument("--types",    type=str, default=None,
+                        help="Comma-separated data types: trades,funding,ohlcv,open_interest (default: all)")
     parser.add_argument("--resume",   action="store_true", default=True, help="Skip already-downloaded dates")
     parser.add_argument("--no-resume", action="store_true", help="Re-download everything")
     args = parser.parse_args()
 
-    exchanges = [args.exchange] if args.exchange else None
-    symbols   = [args.symbol]   if args.symbol   else None
-    resume    = not args.no_resume
+    exchanges  = [args.exchange] if args.exchange else None
+    symbols    = [args.symbol]   if args.symbol   else None
+    resume     = not args.no_resume
+    data_types = [t.strip() for t in args.types.split(",")] if args.types else None
 
-    run_backfill(days=args.days, exchanges=exchanges, symbols=symbols, resume=resume)
+    run_backfill(days=args.days, exchanges=exchanges, symbols=symbols, resume=resume, data_types=data_types)

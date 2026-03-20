@@ -3,7 +3,15 @@ from __future__ import annotations
 
 import json
 
-from processor.schemas import NormalizedBookSnapshot, NormalizedFunding, NormalizedTrade
+from processor.schemas import (
+    NormalizedBookSnapshot,
+    NormalizedFunding,
+    NormalizedLiquidation,
+    NormalizedMarkPrice,
+    NormalizedOHLCV,
+    NormalizedOpenInterest,
+    NormalizedTrade,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +65,57 @@ def normalize_binance_book(raw: dict) -> NormalizedBookSnapshot:
     return _parse_book_snapshot(raw, "binance")
 
 
+def normalize_binance_ohlcv(raw: dict) -> NormalizedOHLCV:
+    return NormalizedOHLCV(
+        exchange="binance",
+        symbol=normalize_symbol(str(raw.get("symbol", ""))),
+        timestamp_ns=int(raw.get("timestamp_ns", 0)),
+        interval=str(raw.get("interval", "1m")),
+        open=float(raw.get("open", 0)),
+        high=float(raw.get("high", 0)),
+        low=float(raw.get("low", 0)),
+        close=float(raw.get("close", 0)),
+        volume=float(raw.get("volume", 0)),
+        quote_volume=float(raw.get("quote_volume", 0)),
+        trades=int(raw["trades"]) if raw.get("trades") and raw["trades"] != "" else None,
+        is_closed=_parse_bool(raw.get("is_closed", False)),
+    )
+
+
+def normalize_binance_oi(raw: dict) -> NormalizedOpenInterest:
+    oiv = raw.get("open_interest_value")
+    return NormalizedOpenInterest(
+        exchange="binance",
+        symbol=normalize_symbol(str(raw.get("symbol", ""))),
+        timestamp_ns=int(raw.get("timestamp_ns", 0)),
+        open_interest=float(raw.get("open_interest", 0)),
+        open_interest_value=float(oiv) if oiv and oiv != "" else None,
+    )
+
+
+def normalize_binance_mark_price(raw: dict) -> NormalizedMarkPrice:
+    ip = raw.get("index_price")
+    return NormalizedMarkPrice(
+        exchange="binance",
+        symbol=normalize_symbol(str(raw.get("symbol", ""))),
+        timestamp_ns=int(raw.get("timestamp_ns", 0)),
+        mark_price=float(raw.get("mark_price", 0)),
+        index_price=float(ip) if ip and ip != "" else None,
+    )
+
+
+def normalize_binance_liquidation(raw: dict) -> NormalizedLiquidation:
+    return NormalizedLiquidation(
+        exchange="binance",
+        symbol=normalize_symbol(str(raw.get("symbol", ""))),
+        timestamp_ns=int(raw.get("timestamp_ns", 0)),
+        side=str(raw.get("side", "buy")),
+        price=float(raw.get("price", 0)),
+        qty=float(raw.get("qty", 0)),
+        order_type=str(raw["order_type"]) if raw.get("order_type") else None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bybit
 # ---------------------------------------------------------------------------
@@ -76,6 +135,57 @@ def normalize_bybit_trade(raw: dict) -> NormalizedTrade:
 
 def normalize_bybit_book(raw: dict) -> NormalizedBookSnapshot:
     return _parse_book_snapshot(raw, "bybit")
+
+
+def normalize_bybit_ohlcv(raw: dict) -> NormalizedOHLCV:
+    return NormalizedOHLCV(
+        exchange="bybit",
+        symbol=normalize_symbol(str(raw.get("symbol", ""))),
+        timestamp_ns=int(raw.get("timestamp_ns", 0)),
+        interval=str(raw.get("interval", "1")),
+        open=float(raw.get("open", 0)),
+        high=float(raw.get("high", 0)),
+        low=float(raw.get("low", 0)),
+        close=float(raw.get("close", 0)),
+        volume=float(raw.get("volume", 0)),
+        quote_volume=float(raw.get("quote_volume", 0)),
+        trades=None,
+        is_closed=_parse_bool(raw.get("is_closed", False)),
+    )
+
+
+def normalize_bybit_oi(raw: dict) -> NormalizedOpenInterest:
+    oiv = raw.get("open_interest_value")
+    return NormalizedOpenInterest(
+        exchange="bybit",
+        symbol=normalize_symbol(str(raw.get("symbol", ""))),
+        timestamp_ns=int(raw.get("timestamp_ns", 0)),
+        open_interest=float(raw.get("open_interest", 0)),
+        open_interest_value=float(oiv) if oiv and oiv != "" else None,
+    )
+
+
+def normalize_bybit_mark_price(raw: dict) -> NormalizedMarkPrice:
+    ip = raw.get("index_price")
+    return NormalizedMarkPrice(
+        exchange="bybit",
+        symbol=normalize_symbol(str(raw.get("symbol", ""))),
+        timestamp_ns=int(raw.get("timestamp_ns", 0)),
+        mark_price=float(raw.get("mark_price", 0)),
+        index_price=float(ip) if ip and ip != "" else None,
+    )
+
+
+def normalize_bybit_liquidation(raw: dict) -> NormalizedLiquidation:
+    return NormalizedLiquidation(
+        exchange="bybit",
+        symbol=normalize_symbol(str(raw.get("symbol", ""))),
+        timestamp_ns=int(raw.get("timestamp_ns", 0)),
+        side=str(raw.get("side", "buy")),
+        price=float(raw.get("price", 0)),
+        qty=float(raw.get("qty", 0)),
+        order_type=None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +218,57 @@ def normalize_okx_funding(raw: dict) -> NormalizedFunding:
 
 def normalize_okx_book(raw: dict) -> NormalizedBookSnapshot:
     return _parse_book_snapshot(raw, "okx")
+
+
+def normalize_okx_ohlcv(raw: dict) -> NormalizedOHLCV:
+    return NormalizedOHLCV(
+        exchange="okx",
+        symbol=normalize_symbol(str(raw.get("symbol", ""))),
+        timestamp_ns=int(raw.get("timestamp_ns", 0)),
+        interval=str(raw.get("interval", "1m")),
+        open=float(raw.get("open", 0)),
+        high=float(raw.get("high", 0)),
+        low=float(raw.get("low", 0)),
+        close=float(raw.get("close", 0)),
+        volume=float(raw.get("volume", 0)),
+        quote_volume=float(raw.get("quote_volume", 0)),
+        trades=int(raw["trades"]) if raw.get("trades") and raw["trades"] != "" else None,
+        is_closed=_parse_bool(raw.get("is_closed", False)),
+    )
+
+
+def normalize_okx_oi(raw: dict) -> NormalizedOpenInterest:
+    oiv = raw.get("open_interest_value")
+    return NormalizedOpenInterest(
+        exchange="okx",
+        symbol=normalize_symbol(str(raw.get("symbol", ""))),
+        timestamp_ns=int(raw.get("timestamp_ns", 0)),
+        open_interest=float(raw.get("open_interest", 0)),
+        open_interest_value=float(oiv) if oiv and oiv != "" else None,
+    )
+
+
+def normalize_okx_mark_price(raw: dict) -> NormalizedMarkPrice:
+    ip = raw.get("index_price")
+    return NormalizedMarkPrice(
+        exchange="okx",
+        symbol=normalize_symbol(str(raw.get("symbol", ""))),
+        timestamp_ns=int(raw.get("timestamp_ns", 0)),
+        mark_price=float(raw.get("mark_price", 0)),
+        index_price=float(ip) if ip and ip != "" else None,
+    )
+
+
+def normalize_okx_liquidation(raw: dict) -> NormalizedLiquidation:
+    return NormalizedLiquidation(
+        exchange="okx",
+        symbol=normalize_symbol(str(raw.get("symbol", ""))),
+        timestamp_ns=int(raw.get("timestamp_ns", 0)),
+        side=str(raw.get("side", "buy")),
+        price=float(raw.get("price", 0)),
+        qty=float(raw.get("qty", 0)),
+        order_type=str(raw["order_type"]) if raw.get("order_type") else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +311,7 @@ def _parse_bool(val) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Dispatch table
+# Dispatch tables
 # ---------------------------------------------------------------------------
 
 TRADE_NORMALIZERS = {
@@ -168,4 +329,28 @@ BOOK_NORMALIZERS = {
 FUNDING_NORMALIZERS = {
     "binance": normalize_binance_funding,
     "okx": normalize_okx_funding,
+}
+
+OHLCV_NORMALIZERS = {
+    "binance": normalize_binance_ohlcv,
+    "bybit": normalize_bybit_ohlcv,
+    "okx": normalize_okx_ohlcv,
+}
+
+OI_NORMALIZERS = {
+    "binance": normalize_binance_oi,
+    "bybit": normalize_bybit_oi,
+    "okx": normalize_okx_oi,
+}
+
+MARK_PRICE_NORMALIZERS = {
+    "binance": normalize_binance_mark_price,
+    "bybit": normalize_bybit_mark_price,
+    "okx": normalize_okx_mark_price,
+}
+
+LIQUIDATION_NORMALIZERS = {
+    "binance": normalize_binance_liquidation,
+    "bybit": normalize_bybit_liquidation,
+    "okx": normalize_okx_liquidation,
 }

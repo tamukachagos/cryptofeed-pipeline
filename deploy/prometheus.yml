@@ -1,0 +1,32 @@
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  scrape_timeout:      10s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+
+  # CryptoFeed API — exposes /metrics (prometheus_client)
+  - job_name: cryptofeed_api
+    static_configs:
+      - targets: ["api:8000"]
+    metrics_path: /metrics
+    scheme: http
+
+  # Redis — via redis_exporter sidecar
+  # Deploy: oliver006/redis_exporter:latest
+  - job_name: redis
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+
+  # Prometheus self-monitoring
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

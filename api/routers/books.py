@@ -13,14 +13,26 @@ from fastapi.responses import StreamingResponse
 
 from api.auth import optional_auth, APIKeyInfo
 from api.models import PaginatedResponse
-from api.rate_limiter import check_rate_limit
+from api.rate_limiter import check_rate_limit, check_daily_quota, record_row_usage, check_cursor_pattern
 from api.routers.trades import _parse_dt, _enforce_plan_window, sys_path_fix
 
 router = APIRouter(tags=["books"])
 
+_replay_engine = None
+
+
+def _get_engine():
+    global _replay_engine
+    if _replay_engine is None:
+        from api.routers.trades import sys_path_fix
+        sys_path_fix()
+        from replay.engine import ReplayEngine
+        _replay_engine = ReplayEngine(data_dir=os.getenv("DATA_DIR", "./data"))
+    return _replay_engine
+
 
 @router.get("/books")
-def get_books(
+async def get_books(
     exchange: str = Query(...),
     symbol: str = Query(...),
     start: str = Query(...),
@@ -31,7 +43,11 @@ def get_books(
     cursor: str | None = Query(None),
     key: APIKeyInfo = Depends(optional_auth),
 ):
-    check_rate_limit(key)
+    await check_rate_limit(key)
+    await check_daily_quota(key)
+    await check_cursor_pattern(key, cursor)
+    from api.routers.trades import _validate_path_params
+    _validate_path_params(exchange, symbol)
 
     # Enforce plan level cap
     levels = min(levels, key.max_levels)
@@ -41,12 +57,9 @@ def get_books(
     if end_dt <= start_dt:
         raise HTTPException(status_code=400, detail="end must be after start")
     _enforce_plan_window(start_dt, end_dt, key)
+    limit = min(limit, key.max_rows)
 
-    sys_path_fix()
-    from replay.engine import ReplayEngine
-    data_dir = os.getenv("DATA_DIR", "./data")
-    engine = ReplayEngine(data_dir=data_dir)
-
+    engine = _get_engine()
     df = engine._load("books", exchange.lower(), symbol.upper(), start_dt, end_dt)
 
     if df.empty:
@@ -61,6 +74,7 @@ def get_books(
 
     total = len(df)
     df = df.head(limit)
+    await record_row_usage(key, len(df))
     next_cursor = str(int(df["timestamp_ns"].iloc[-1])) if len(df) == limit and total > limit else None
 
     # Trim bids/asks to requested levels

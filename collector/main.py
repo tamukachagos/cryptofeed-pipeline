@@ -24,14 +24,17 @@ async def main() -> None:
     symbols_raw = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT")
     symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
 
-    redis_host = os.getenv("REDIS_HOST", "localhost")
-    redis_port = int(os.getenv("REDIS_PORT", 6379))
-    stream_maxlen = int(os.getenv("REDIS_STREAM_MAXLEN", 100_000))
+    redis_host     = os.getenv("REDIS_HOST", "localhost")
+    redis_port     = int(os.getenv("REDIS_PORT", 6379))
+    redis_password = os.getenv("REDIS_PASSWORD", "")
+    stream_maxlen  = int(os.getenv("REDIS_STREAM_MAXLEN", 100_000))
 
-    redis_client = await aioredis.from_url(
-        f"redis://{redis_host}:{redis_port}",
-        decode_responses=True,
+    redis_url = (
+        f"redis://:{redis_password}@{redis_host}:{redis_port}"
+        if redis_password else
+        f"redis://{redis_host}:{redis_port}"
     )
+    redis_client = await aioredis.from_url(redis_url, decode_responses=True)
 
     connectors = []
 

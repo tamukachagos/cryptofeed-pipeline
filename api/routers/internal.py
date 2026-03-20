@@ -2,49 +2,40 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 import hashlib
 from datetime import datetime, UTC
-from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
 
+from api.db import get_db
+
 INTERNAL_SECRET = os.getenv("INTERNAL_API_SECRET", "")
-DB_PATH = Path(os.getenv("DATA_DIR", "./data")) / "users.db"
+
+# Comma-separated list of IPs allowed to call /internal/* (empty = any IP allowed)
+_INTERNAL_ALLOWED_IPS_RAW = os.getenv("INTERNAL_ALLOWED_IPS", "")
+_INTERNAL_ALLOWED_IPS: set[str] = {
+    ip.strip() for ip in _INTERNAL_ALLOWED_IPS_RAW.split(",") if ip.strip()
+}
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
 
-def _require_secret(secret: Optional[str]) -> None:
+def _require_secret(secret: Optional[str], request: Optional[Request] = None) -> None:
     if not INTERNAL_SECRET:
         raise HTTPException(status_code=503, detail="Internal API not configured")
+    # IP allowlist (if configured)
+    if _INTERNAL_ALLOWED_IPS and request is not None:
+        client_ip = request.client.host if request.client else ""
+        if client_ip not in _INTERNAL_ALLOWED_IPS:
+            raise HTTPException(status_code=403, detail="Forbidden")
     if secret != INTERNAL_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
-def _get_db() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            plan TEXT NOT NULL DEFAULT 'free',
-            api_key_hash TEXT,
-            api_key_prefix TEXT,
-            stripe_customer_id TEXT,
-            created_at TEXT NOT NULL,
-            requests_today INTEGER NOT NULL DEFAULT 0,
-            requests_this_month INTEGER NOT NULL DEFAULT 0,
-            last_request_date TEXT,
-            daily_usage TEXT NOT NULL DEFAULT '0,0,0,0,0,0,0'
-        )
-    """)
-    conn.commit()
-    return conn
+def _get_db():
+    return get_db()
 
 
 class CreateUserRequest(BaseModel):
@@ -58,9 +49,10 @@ class CreateUserRequest(BaseModel):
 @router.get("/users/{email}")
 async def get_user(
     email: str,
+    request: Request,
     x_internal_secret: Optional[str] = Header(None),
 ):
-    _require_secret(x_internal_secret)
+    _require_secret(x_internal_secret, request)
     conn = _get_db()
     try:
         row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
@@ -74,9 +66,10 @@ async def get_user(
 @router.post("/users", status_code=201)
 async def create_user(
     body: CreateUserRequest,
+    request: Request,
     x_internal_secret: Optional[str] = Header(None),
 ):
-    _require_secret(x_internal_secret)
+    _require_secret(x_internal_secret, request)
     conn = _get_db()
     try:
         conn.execute(
@@ -103,9 +96,10 @@ async def create_user(
 async def update_user(
     email: str,
     body: dict,
+    request: Request,
     x_internal_secret: Optional[str] = Header(None),
 ):
-    _require_secret(x_internal_secret)
+    _require_secret(x_internal_secret, request)
     allowed = {"plan", "api_key_hash", "api_key_prefix", "stripe_customer_id"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
@@ -130,9 +124,10 @@ async def update_user(
 @router.get("/users/{email}/stats")
 async def get_user_stats(
     email: str,
+    request: Request,
     x_internal_secret: Optional[str] = Header(None),
 ):
-    _require_secret(x_internal_secret)
+    _require_secret(x_internal_secret, request)
     conn = _get_db()
     try:
         row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()

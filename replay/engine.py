@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Iterator, Union
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from processor.schemas import NormalizedBookSnapshot, NormalizedFunding, NormalizedTrade
 
@@ -131,18 +132,24 @@ class ReplayEngine:
         if not base.exists():
             return pd.DataFrame()
 
+        # PyArrow push-down filter: skip decoding row groups outside the time range
+        pq_filters = [
+            ("timestamp_ns", ">=", start_ns),
+            ("timestamp_ns", "<",  end_ns),
+        ]
+
         dfs = []
         current = start.replace(minute=0, second=0, microsecond=0)
+        from datetime import timedelta
         while current <= end:
             hour_path = base / current.strftime("%Y-%m-%d") / str(current.hour) / "data.parquet"
             if hour_path.exists():
                 try:
-                    df = pd.read_parquet(hour_path)
-                    dfs.append(df)
+                    table = pq.read_table(hour_path, filters=pq_filters)
+                    if table.num_rows:
+                        dfs.append(table.to_pandas())
                 except Exception:
                     pass
-            # Advance one hour
-            from datetime import timedelta
             current = current + timedelta(hours=1)
 
         if not dfs:
@@ -150,9 +157,7 @@ class ReplayEngine:
 
         df = pd.concat(dfs, ignore_index=True)
         if "timestamp_ns" in df.columns:
-            df = df[
-                (df["timestamp_ns"] >= start_ns) & (df["timestamp_ns"] < end_ns)
-            ].sort_values("timestamp_ns").reset_index(drop=True)
+            df = df.sort_values("timestamp_ns").reset_index(drop=True)
         return df
 
 

@@ -54,34 +54,57 @@ class ParquetWriter:
             self._flush(key, exchange, symbol, hour_key)
 
     def _flush(self, key: str, exchange: str, symbol: str, hour_key: str) -> None:
-        """Write buffered rows to Parquet atomically."""
+        """Write buffered rows to Parquet atomically.
+
+        On OSError (e.g. disk full), rows are re-queued into the buffer so they
+        are not lost. The next write() call will retry after the threshold is
+        reached again.
+        """
         rows = self._buffers.pop(key, [])
         self._last_flush.pop(key, None)
         if not rows:
             return
 
         out_dir = self.data_dir / self.data_type / exchange / symbol / hour_key
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / "data.parquet"
         tmp_path = out_dir / "data.parquet.tmp"
+        out_path = out_dir / "data.parquet"
 
-        df = pd.DataFrame(rows)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Merge with existing file if it exists (append mode)
-        if out_path.exists():
-            existing = pd.read_parquet(out_path)
-            df = pd.concat([existing, df], ignore_index=True)
-            if "timestamp_ns" in df.columns:
-                df = df.drop_duplicates("timestamp_ns").sort_values("timestamp_ns")
+            df = pd.DataFrame(rows)
 
-        table = pa.Table.from_pandas(df, preserve_index=False)
-        pq.write_table(table, tmp_path, compression=self.compression)
-        os.replace(tmp_path, out_path)  # Atomic rename
+            # Merge with existing file if it exists (append mode)
+            if out_path.exists():
+                existing = pd.read_parquet(out_path)
+                df = pd.concat([existing, df], ignore_index=True)
+                if "timestamp_ns" in df.columns:
+                    df = df.drop_duplicates("timestamp_ns").sort_values("timestamp_ns")
 
-        logger.debug(
-            f"[ParquetWriter] Flushed {len(rows)} rows → "
-            f"{self.data_type}/{exchange}/{symbol}/{hour_key}"
-        )
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            pq.write_table(table, tmp_path, compression=self.compression)
+            os.replace(tmp_path, out_path)  # Atomic rename
+
+            logger.debug(
+                f"[ParquetWriter] Flushed {len(rows)} rows → "
+                f"{self.data_type}/{exchange}/{symbol}/{hour_key}"
+            )
+        except OSError as exc:
+            # Disk full or other I/O error — re-queue rows to avoid data loss
+            logger.error(
+                f"[ParquetWriter] Flush failed for {key}: {exc}. "
+                f"Re-queuing {len(rows)} rows for next flush attempt."
+            )
+            if key not in self._buffers:
+                self._buffers[key] = []
+                self._last_flush[key] = time.monotonic()
+            self._buffers[key] = rows + self._buffers[key]
+            # Clean up partial .tmp file if it was created
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
 
     def flush_all(self) -> None:
         """Force flush all buffers. Call on shutdown."""

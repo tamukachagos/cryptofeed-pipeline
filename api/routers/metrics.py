@@ -14,16 +14,24 @@ from api.routers.trades import _parse_dt, _enforce_plan_window, sys_path_fix
 
 router = APIRouter(tags=["metrics"])
 
+_replay_engine = None
+
+
+def _get_engine():
+    global _replay_engine
+    if _replay_engine is None:
+        sys_path_fix()
+        from replay.engine import ReplayEngine
+        _replay_engine = ReplayEngine(data_dir=os.getenv("DATA_DIR", "./data"))
+    return _replay_engine
+
 
 def _load_trades(exchange, symbol, start_dt, end_dt) -> pd.DataFrame:
-    sys_path_fix()
-    from replay.engine import ReplayEngine
-    data_dir = os.getenv("DATA_DIR", "./data")
-    return ReplayEngine(data_dir=data_dir)._load("trades", exchange.lower(), symbol.upper(), start_dt, end_dt)
+    return _get_engine()._load("trades", exchange.lower(), symbol.upper(), start_dt, end_dt)
 
 
 @router.get("/metrics/trade-imbalance")
-def trade_imbalance(
+async def trade_imbalance(
     exchange: str = Query(...),
     symbol: str = Query(...),
     start: str = Query(...),
@@ -32,7 +40,9 @@ def trade_imbalance(
     key: APIKeyInfo = Depends(optional_auth),
 ):
     """Rolling buy/sell volume imbalance. 1.0 = all buys, 0.0 = all sells."""
-    check_rate_limit(key)
+    await check_rate_limit(key)
+    from api.routers.trades import _validate_path_params
+    _validate_path_params(exchange, symbol)
     start_dt, end_dt = _parse_dt(start), _parse_dt(end)
     _enforce_plan_window(start_dt, end_dt, key)
 
@@ -53,7 +63,7 @@ def trade_imbalance(
 
 
 @router.get("/metrics/obi")
-def order_book_imbalance(
+async def order_book_imbalance(
     exchange: str = Query(...),
     symbol: str = Query(...),
     start: str = Query(...),
@@ -62,15 +72,15 @@ def order_book_imbalance(
     key: APIKeyInfo = Depends(optional_auth),
 ):
     """Order book imbalance from book snapshots. Range [-1, 1]."""
-    check_rate_limit(key)
+    await check_rate_limit(key)
+    from api.routers.trades import _validate_path_params
+    _validate_path_params(exchange, symbol)
     start_dt, end_dt = _parse_dt(start), _parse_dt(end)
     _enforce_plan_window(start_dt, end_dt, key)
 
     sys_path_fix()
     from features.microstructure import compute_obi
-    from replay.engine import ReplayEngine
-    data_dir = os.getenv("DATA_DIR", "./data")
-    df = ReplayEngine(data_dir=data_dir)._load("books", exchange.lower(), symbol.upper(), start_dt, end_dt)
+    df = _get_engine()._load("books", exchange.lower(), symbol.upper(), start_dt, end_dt)
 
     if df.empty:
         return PaginatedResponse(data=[], count=0, next_cursor=None,
@@ -85,7 +95,7 @@ def order_book_imbalance(
 
 
 @router.get("/metrics/vpin")
-def vpin(
+async def vpin(
     exchange: str = Query(...),
     symbol: str = Query(...),
     start: str = Query(...),
@@ -94,7 +104,9 @@ def vpin(
     key: APIKeyInfo = Depends(optional_auth),
 ):
     """Volume-synchronized PIN (toxicity proxy). Higher = more toxic order flow."""
-    check_rate_limit(key)
+    await check_rate_limit(key)
+    from api.routers.trades import _validate_path_params
+    _validate_path_params(exchange, symbol)
     start_dt, end_dt = _parse_dt(start), _parse_dt(end)
     _enforce_plan_window(start_dt, end_dt, key)
 

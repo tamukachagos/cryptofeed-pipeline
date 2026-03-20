@@ -1,33 +1,30 @@
-"""Trades data endpoint — the core API product."""
+"""Liquidations data endpoint."""
 from __future__ import annotations
 
 import io
-import json
 import os
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 
 from api.auth import optional_auth, APIKeyInfo
-from api.models import TradeRecord, PaginatedResponse
+from api.models import PaginatedResponse
 from api.rate_limiter import check_rate_limit, check_daily_quota, record_row_usage, check_cursor_pattern
 
-router = APIRouter(tags=["trades"])
+router = APIRouter(tags=["liquidations"])
 
 MAX_ROWS_PER_REQUEST = 50_000
 
-# Module-level singleton so Parquet directory state is shared across requests
 _replay_engine = None
 
 
 def _get_engine():
     global _replay_engine
     if _replay_engine is None:
-        sys_path_fix()
+        _sys_path_fix()
         from replay.engine import ReplayEngine
         _replay_engine = ReplayEngine(data_dir=os.getenv("DATA_DIR", "./data"))
     return _replay_engine
@@ -40,19 +37,7 @@ def _parse_dt(s: str) -> datetime:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
     except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid datetime: {s}. Use ISO 8601 (e.g. 2026-03-17T00:00:00Z)")
-
-
-_VALID_EXCHANGES = {"binance", "bybit", "okx"}
-_SYMBOL_RE = __import__("re").compile(r"^[A-Z0-9]{3,20}$")
-
-
-def _validate_path_params(exchange: str, symbol: str) -> None:
-    """Guard against path traversal in exchange/symbol file-path components."""
-    if exchange.lower() not in _VALID_EXCHANGES:
-        raise HTTPException(status_code=400, detail=f"Unknown exchange: {exchange}. Use: binance, bybit, okx")
-    if not _SYMBOL_RE.match(symbol.upper()):
-        raise HTTPException(status_code=400, detail=f"Invalid symbol format: {symbol}. Use e.g. BTCUSDT")
+        raise HTTPException(status_code=400, detail=f"Invalid datetime: {s}. Use ISO 8601.")
 
 
 def _enforce_plan_window(start: datetime, end: datetime, key: APIKeyInfo) -> None:
@@ -60,25 +45,26 @@ def _enforce_plan_window(start: datetime, end: datetime, key: APIKeyInfo) -> Non
     if delta_days > key.max_days:
         raise HTTPException(
             status_code=403,
-            detail=f"Your {key.plan} plan allows max {key.max_days} days per request. "
-                   f"Requested {delta_days:.1f} days. Upgrade at cryptofeed.io/pricing"
+            detail=f"Your {key.plan} plan allows max {key.max_days} days per request."
         )
 
 
-@router.get("/trades")
-async def get_trades(
-    exchange: str = Query(..., description="Exchange name: binance, bybit, okx"),
+@router.get("/liquidations")
+async def get_liquidations(
+    exchange: str = Query(..., description="Exchange: binance, bybit, okx"),
     symbol: str = Query(..., description="Symbol e.g. BTCUSDT"),
-    start: str = Query(..., description="Start time ISO 8601 e.g. 2026-03-17T00:00:00Z"),
+    start: str = Query(..., description="Start time ISO 8601"),
     end: str = Query(..., description="End time ISO 8601"),
-    format: str = Query("json", description="Response format: json, csv, parquet"),
+    side: str | None = Query(None, description="Filter by side: buy or sell"),
+    format: str = Query("json", description="json, csv, or parquet"),
     limit: int = Query(10_000, ge=1, le=MAX_ROWS_PER_REQUEST),
-    cursor: str | None = Query(None, description="Pagination cursor from previous response"),
+    cursor: str | None = Query(None),
     key: APIKeyInfo = Depends(optional_auth),
 ):
     await check_rate_limit(key)
     await check_daily_quota(key)
     await check_cursor_pattern(key, cursor)
+    from api.routers.trades import _validate_path_params
     _validate_path_params(exchange, symbol)
 
     start_dt = _parse_dt(start)
@@ -88,23 +74,21 @@ async def get_trades(
     _enforce_plan_window(start_dt, end_dt, key)
     limit = min(limit, key.max_rows)
 
-    # Load from Parquet
     engine = _get_engine()
-    df = engine._load("trades", exchange.lower(), symbol.upper(), start_dt, end_dt)
+    df = engine._load("liquidations", exchange.lower(), symbol.upper(), start_dt, end_dt)
+
+    if not df.empty and side:
+        df = df[df["side"] == side.lower()]
 
     if df.empty:
         if format == "json":
-            return PaginatedResponse(
-                data=[], count=0, next_cursor=None,
-                exchange=exchange, symbol=symbol, start=start, end=end
-            )
+            return PaginatedResponse(data=[], count=0, next_cursor=None,
+                                     exchange=exchange, symbol=symbol, start=start, end=end)
         return Response(content="", media_type="text/csv")
 
-    # Apply cursor (offset by timestamp_ns)
     if cursor:
         try:
-            cursor_ns = int(cursor)
-            df = df[df["timestamp_ns"] > cursor_ns]
+            df = df[df["timestamp_ns"] > int(cursor)]
         except ValueError:
             pass
 
@@ -117,34 +101,23 @@ async def get_trades(
         buf = io.BytesIO()
         df.to_parquet(buf, index=False, compression="zstd")
         buf.seek(0)
-        filename = f"trades_{exchange}_{symbol}_{start[:10]}_{end[:10]}.parquet"
-        return StreamingResponse(
-            buf,
-            media_type="application/octet-stream",
-            headers={"Content-Disposition": f"attachment; filename={filename}",
-                     "X-Request-ID": str(uuid.uuid4())},
-        )
+        return StreamingResponse(buf, media_type="application/octet-stream",
+                                 headers={"Content-Disposition": f"attachment; filename=liquidations_{exchange}_{symbol}_{start[:10]}_{end[:10]}.parquet",
+                                          "X-Request-ID": str(uuid.uuid4())})
 
     if format == "csv":
-        csv_buf = io.StringIO()
         df["timestamp"] = pd.to_datetime(df["timestamp_ns"], unit="ns", utc=True).dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        df.to_csv(csv_buf, index=False)
-        csv_buf.seek(0)
-        filename = f"trades_{exchange}_{symbol}_{start[:10]}_{end[:10]}.csv"
-        return StreamingResponse(
-            io.BytesIO(csv_buf.getvalue().encode()),
-            media_type="text/csv",
-            headers={"Content-Disposition": f"attachment; filename={filename}",
-                     "X-Request-ID": str(uuid.uuid4())},
-        )
+        buf = io.StringIO()
+        df.to_csv(buf, index=False)
+        buf.seek(0)
+        return StreamingResponse(io.BytesIO(buf.getvalue().encode()), media_type="text/csv",
+                                 headers={"Content-Disposition": f"attachment; filename=liquidations_{exchange}_{symbol}_{start[:10]}_{end[:10]}.csv",
+                                          "X-Request-ID": str(uuid.uuid4())})
 
-    # JSON (default)
     df["timestamp"] = pd.to_datetime(df["timestamp_ns"], unit="ns", utc=True).dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    records = df.to_dict(orient="records")
-
     return PaginatedResponse(
-        data=records,
-        count=len(records),
+        data=df.to_dict(orient="records"),
+        count=len(df),
         total_available=total,
         next_cursor=next_cursor,
         exchange=exchange,
@@ -154,7 +127,7 @@ async def get_trades(
     )
 
 
-def sys_path_fix():
+def _sys_path_fix():
     import sys
     from pathlib import Path
     root = str(Path(__file__).resolve().parents[2])

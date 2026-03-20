@@ -28,6 +28,7 @@ from loguru import logger
 SCHEDULE = [
     {"name": "exchange_health",       "module": "agents.exchange_health",  "fn": "check_health",       "interval_s": 300},
     {"name": "vercel_watchdog",       "module": "agents.vercel_agent",     "fn": "check_deployments",  "interval_s": 300},
+    {"name": "backfill_watchdog",     "module": "agents.backfill_watchdog","fn": "main",               "interval_s": 300},
     {"name": "quality_monitor",       "module": "agents.quality_monitor",  "fn": "main",               "interval_s": 3600},
     {"name": "vercel_performance",    "module": "agents.vercel_agent",     "fn": "audit_performance",  "interval_s": 3600},
     {"name": "gap_filler",            "module": "agents.gap_filler",       "fn": "main",               "interval_s": 21600},
